@@ -1,7 +1,15 @@
+# Environment variables
+.env
+*.db
+.env.*
+!.env.example
+
+# Python
 venv/
+.venv/
 __pycache__/
 *.pyc
-.env
-.venv/
-.idea/
+
+# IDE
 .vscode/
+.idea/
