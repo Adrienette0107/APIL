@@ -1,3 +1,6 @@
-from .analyzer import AdaptiveAnalyzer
+from .analyzer import PromptAnalysis, analyze_prompt
 
-__all__ = ["AdaptiveAnalyzer"]
+__all__ = [
+    "PromptAnalysis",
+    "analyze_prompt",
+]

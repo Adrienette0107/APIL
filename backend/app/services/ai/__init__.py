@@ -1,5 +1,5 @@
-from .base import BaseAIProvider
-from .ollama_provider import OllamaProvider
-from .provider_router import get_provider
+from .base import AIProvider
 
-__all__ = ["BaseAIProvider", "OllamaProvider", "get_provider"]
+__all__ = [
+    "AIProvider",
+]
