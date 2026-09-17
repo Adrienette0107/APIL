@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
-from groq import Groq
-
+from backend.app.core.errors import ProviderExecutionError
 from backend.app.services.ai.base import AIProvider
 
 
@@ -14,20 +12,42 @@ class GroqProvider(AIProvider):
     name = "groq"
 
     def __init__(self, api_key: str | None = None):
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
-        self.client = Groq(api_key=self.api_key) if self.api_key else None
+        self.api_key = api_key
+        self.client = None
 
     async def generate(
         self,
         messages: list[dict[str, Any]],
         model: str,
     ) -> str:
-        if not self.client:
-            raise ValueError("GROQ_API_KEY is not configured.")
+        if not self.api_key:
+            raise ProviderExecutionError(
+                code="provider_authentication_failed",
+                message="The AI provider is not configured.",
+                status_code=502,
+            )
 
-        response = self.client.chat.completions.create(
+        try:
+            from groq import AsyncGroq
+        except ImportError as exc:
+            raise ProviderExecutionError(
+                code="provider_sdk_unavailable",
+                message="The AI provider SDK is not installed.",
+            ) from exc
+
+        if self.client is None:
+            self.client = AsyncGroq(api_key=self.api_key)
+
+        response = await self.client.chat.completions.create(
             model=model,
             messages=messages,
         )
 
-        return response.choices[0].message.content or ""
+        content = response.choices[0].message.content
+        if not isinstance(content, str) or not content.strip():
+            raise ProviderExecutionError(
+                code="invalid_provider_response",
+                message="The AI provider returned an empty response.",
+            )
+
+        return content

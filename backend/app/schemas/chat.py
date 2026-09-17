@@ -52,3 +52,5 @@ class ChatResponse(BaseModel):
     original_prompt: str
     selected_model: str
     message: str
+    processed_prompt: str | None = None
+    selected_provider: str | None = None

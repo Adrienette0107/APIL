@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     ANTHROPIC_API_KEY: str | None = None
 
+    OLLAMA_URL: str = "http://127.0.0.1:11434"
+    OLLAMA_MODEL: str = "qwen3:4b"
+    OLLAMA_TIMEOUT_SECONDS: float = 60.0
+
     APIL_API_KEY: str | None = None
 
     RATE_LIMIT_REQUESTS: int = 30

@@ -48,3 +48,9 @@ def root():
         "version": settings.APP_VERSION,
         "status": "running",
     }
+from backend.app.api.optimization import (
+    router as optimization_router,
+)
+app.include_router(
+    optimization_router
+)

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
-import google.generativeai as genai
-
+from backend.app.core.errors import ProviderExecutionError
 from backend.app.services.ai.base import AIProvider
 
 
@@ -14,9 +12,7 @@ class GeminiProvider(AIProvider):
     name = "gemini"
 
     def __init__(self, api_key: str | None = None):
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        if self.api_key:
-            genai.configure(api_key=self.api_key)
+        self.api_key = api_key
 
     async def generate(
         self,
@@ -24,7 +20,21 @@ class GeminiProvider(AIProvider):
         model: str,
     ) -> str:
         if not self.api_key:
-            raise ValueError("GEMINI_API_KEY is not configured.")
+            raise ProviderExecutionError(
+                code="provider_authentication_failed",
+                message="The AI provider is not configured.",
+                status_code=502,
+            )
+
+        try:
+            import google.generativeai as genai
+        except ImportError as exc:
+            raise ProviderExecutionError(
+                code="provider_sdk_unavailable",
+                message="The AI provider SDK is not installed.",
+            ) from exc
+
+        genai.configure(api_key=self.api_key)
 
         prompt = "\n".join(
             f"{message.get('role', 'user')}: {message.get('content', '')}"
@@ -32,4 +42,11 @@ class GeminiProvider(AIProvider):
         )
         model_obj = genai.GenerativeModel(model)
         response = model_obj.generate_content(prompt)
-        return response.text or ""
+        content = response.text
+        if not isinstance(content, str) or not content.strip():
+            raise ProviderExecutionError(
+                code="invalid_provider_response",
+                message="The AI provider returned an empty response.",
+            )
+
+        return content

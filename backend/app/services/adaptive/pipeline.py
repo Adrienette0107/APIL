@@ -1,5 +1,8 @@
 from backend.app.services.adaptive.analyzer import analyze_prompt
-from backend.app.services.adaptive.optimizer import build_adaptive_instruction
+from backend.app.services.adaptive.optimizer import (
+    build_adaptive_instruction,
+    build_optimized_prompt,
+)
 from backend.app.services.adaptive.response import adapt_response
 
 
@@ -15,6 +18,13 @@ def build_adaptive_messages(
         preferences=preferences,
     )
 
+    optimized_prompt = build_optimized_prompt(
+        prompt=prompt,
+        analysis=analysis,
+        preferences=preferences,
+        has_context=bool(history),
+    )
+
     messages = [
         {
             "role": "system",
@@ -24,11 +34,20 @@ def build_adaptive_messages(
 
     messages.extend(history)
 
-    if not history or history[-1].get("content") != prompt:
+    if (
+        history
+        and history[-1].get("role") == "user"
+        and history[-1].get("content") == prompt
+    ):
+        messages[-1] = {
+            "role": "user",
+            "content": optimized_prompt,
+        }
+    else:
         messages.append(
             {
                 "role": "user",
-                "content": prompt,
+                "content": optimized_prompt,
             }
         )
 
