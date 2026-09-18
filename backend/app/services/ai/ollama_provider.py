@@ -16,6 +16,64 @@ class OllamaProvider(AIProvider):
         self.default_model = default_model
         self.timeout_seconds = settings.OLLAMA_TIMEOUT_SECONDS
 
+    def _get_num_predict(self, prompt: str) -> int:
+        """
+        Dynamically determine the maximum number of generated tokens
+        based on the complexity and expected output type of the prompt.
+        """
+
+        prompt_lower = prompt.lower()
+
+        # Code / programming requests generally need more output.
+        code_keywords = [
+            "code",
+            "program",
+            "python",
+            "javascript",
+            "java",
+            "c++",
+            "api",
+            "function",
+            "class",
+            "implement",
+            "build",
+            "debug",
+            "sql",
+            "html",
+            "css",
+            "react",
+            "fastapi",
+        ]
+
+        # Detailed requests need more generation space.
+        detailed_keywords = [
+            "detailed",
+            "in detail",
+            "comprehensive",
+            "step by step",
+            "deep explanation",
+            "explain everything",
+            "thoroughly",
+            "architecture",
+            "complete",
+        ]
+
+        if any(keyword in prompt_lower for keyword in code_keywords):
+            return 8192
+
+        if any(keyword in prompt_lower for keyword in detailed_keywords):
+            return 8192
+
+        # Long prompts can indicate more complex tasks.
+        if len(prompt) > 3000:
+            return 8192
+
+        if len(prompt) > 1000:
+            return 6144
+
+        # Normal questions.
+        return 4096
+
     async def generate(
         self,
         messages: list[dict[str, Any]],
@@ -24,10 +82,22 @@ class OllamaProvider(AIProvider):
         max_tokens: int | None = None,
     ) -> str:
 
-        options = {
-            "temperature": temperature,
-        }
+        # Extract the actual prompt sent to the provider.
+        prompt = "\n".join(
+            str(message.get("content", ""))
+            for message in messages
+            if isinstance(message, dict)
+        )
 
+        # Dynamically determine generation length.
+        
+        num_predict = self._get_num_predict(prompt)
+
+        options = {
+            "num_predict": num_predict,
+}
+
+        # Explicit max_tokens from the caller takes priority.
         if max_tokens is not None:
             options["num_predict"] = max_tokens
 
@@ -38,21 +108,26 @@ class OllamaProvider(AIProvider):
                 self.client.chat(
                     model=selected_model,
                     messages=messages,
+                    think=False,
+                    keep_alive=settings.OLLAMA_KEEP_ALIVE,
                     options=options,
                 ),
                 timeout=self.timeout_seconds,
             )
+
         except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
             raise ProviderExecutionError(
                 code="provider_timeout",
                 message="The AI provider timed out.",
                 status_code=504,
             ) from exc
+
         except httpx.RequestError as exc:
             raise ProviderExecutionError(
                 code="provider_unavailable",
                 message="The AI provider is unavailable.",
             ) from exc
+
         except Exception as exc:
             provider_status = getattr(exc, "status_code", None)
 
@@ -75,6 +150,7 @@ class OllamaProvider(AIProvider):
                 message="The AI provider returned an error.",
             ) from exc
 
+        # Extract response content.
         if isinstance(response, dict):
             message = response.get("message")
             content = (
@@ -92,4 +168,18 @@ class OllamaProvider(AIProvider):
                 message="The AI provider returned an empty response.",
             )
 
+        # Remove Qwen3 thinking content if present.
+        if "</think>" in content:
+            content = content.split("</think>", 1)[1].strip()
+
+        elif "<think>" in content:
+            content = content.split("<think>", 1)[0].strip()
+
+        if not content:
+            raise ProviderExecutionError(
+                code="invalid_provider_response",
+                message="The AI provider returned no final answer.",
+            )
+
         return content
+

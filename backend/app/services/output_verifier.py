@@ -7,6 +7,7 @@ class OutputVerifier:
         self,
         original_prompt: str,
         response: str,
+        preferences: dict | None = None,
     ) -> dict:
 
         issues = []

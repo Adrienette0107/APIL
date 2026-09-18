@@ -66,7 +66,7 @@ async def chat(
         )
 
         preferences = (
-            request.preferences.model_dump()
+            request.preferences.model_dump(exclude_none=True)
             if request.preferences
             else {}
         )
@@ -101,9 +101,14 @@ async def chat(
             request_id=request_id,
             status="success",
             original_prompt=request.prompt,
+            optimized_prompt=result["optimized_prompt"],
+            prompt_dna=result["prompt_dna"],
             processed_prompt=result["processed_prompt"],
             selected_provider=result["provider"],
             selected_model=result["model"],
+            response=result["response"],
+            response_evaluation=result.get("response_evaluation"),
+            improvement_applied=result.get("improvement_applied", False),
             message=result["response"],
         )
 

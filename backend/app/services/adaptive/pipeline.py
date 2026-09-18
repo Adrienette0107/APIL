@@ -10,8 +10,9 @@ def build_adaptive_messages(
     prompt: str,
     history: list[dict],
     preferences: dict | None = None,
+    analysis=None,
 ):
-    analysis = analyze_prompt(prompt)
+    analysis = analysis or analyze_prompt(prompt)
 
     instruction = build_adaptive_instruction(
         analysis=analysis,
