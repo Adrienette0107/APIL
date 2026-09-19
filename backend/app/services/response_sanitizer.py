@@ -45,6 +45,30 @@ def _extract_content(value: Any) -> str:
 def _strip_unmarked_reasoning_preamble(text: str) -> str:
     """Remove a clearly meta-level preamble without matching a topic or task."""
 
+    lines = text.splitlines()
+    leading_meta = 0
+    leading_end = 0
+    for index, line in enumerate(lines):
+        if not line.strip():
+            leading_end = index + 1
+            continue
+        if _REASONING_LINE.match(line) or re.match(
+            r"^\s*(?:another idea|wait|maybe|the answer should)\b",
+            line,
+            re.IGNORECASE,
+        ):
+            leading_meta += 1
+            leading_end = index + 1
+            continue
+        break
+
+    if leading_meta >= 2:
+        remaining = lines[leading_end:]
+        candidate = "\n".join(remaining).strip()
+        if candidate:
+            return candidate
+        return ""
+
     paragraphs = re.split(r"\n\s*\n", text)
     if len(paragraphs) < 2:
         return text
@@ -93,6 +117,16 @@ def sanitize_model_output(content: Any, provider: str | None = None) -> str:
 
     text = re.sub(
         r"(?is)\[(?:begin|end)\s+(?:think|thinking|analysis|reasoning)\]",
+        " ",
+        text,
+    )
+    text = re.sub(
+        r"(?is)<\|begin_of_(?:thought|thinking|analysis)\|>.*?<\|end_of_(?:thought|thinking|analysis)\|>",
+        " ",
+        text,
+    )
+    text = re.sub(
+        r"(?is)<\|(?:begin|end)_of_(?:thought|thinking|analysis)\|>",
         " ",
         text,
     )

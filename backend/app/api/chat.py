@@ -23,6 +23,7 @@ from backend.app.services.apil_pipeline import process_chat
 from backend.app.services.preferences_service import (
     save_user_preferences,
 )
+from backend.app.services.response_sanitizer import sanitize_model_output
 
 router = APIRouter(
     prefix="/v1",
@@ -112,6 +113,8 @@ async def chat(
             message=result["response"],
             provider_call_count=result.get("provider_call_count", 1),
             timing=result.get("timing"),
+            improvement_attempted=result.get("improvement_attempted", False),
+            improvement_failure_reason=result.get("improvement_error"),
         )
 
     except PermissionError:
@@ -173,11 +176,15 @@ async def diagnostic_test(payload: dict):
         "selected_provider": payload.get("selected_provider", "unknown"),
         "selected_model": payload.get("selected_model", "unknown"),
         "provider_call_count": int(payload.get("provider_call_count", 1) or 1),
-        "raw_provider_response": payload.get("raw_provider_response", final_response),
+        "raw_provider_response": sanitize_model_output(
+            payload.get("raw_provider_response", final_response)
+        ),
         "response_evaluation": payload.get("response_evaluation") or {},
         "improvement_needed": bool(payload.get("improvement_needed", False)),
         "improvement_attempts": int(payload.get("improvement_attempts", 0) or 0),
+        "improvement_attempted": bool(payload.get("improvement_attempted", False)),
         "improvement_applied": bool(payload.get("improvement_applied", False)),
+        "improvement_failure_reason": payload.get("improvement_failure_reason"),
         "improved_response": payload.get("improved_response", final_response),
         "final_quality_gate": payload.get("final_quality_gate") or {"passed": True},
         "final_response": final_response,

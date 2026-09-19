@@ -233,6 +233,7 @@ async def process_chat(
     improvement_error = None
     attempts = 0
     improvement_ms = 0
+    improvement_attempted = False
 
     if response_evaluation.get("improvement_needed") and attempts < max_improvement_attempts:
         improvement_start = time.perf_counter()
@@ -246,6 +247,9 @@ async def process_chat(
             model_name=selected_model,
         )
         improvement_ms += int((time.perf_counter() - improvement_start) * 1000)
+        improvement_attempted = bool(improved_result.get("improvement_attempted", True))
+        if improvement_attempted:
+            provider_call_count += 1
         if improved_result.get("improvement_applied"):
             improved_response = improved_result["response"]
             final_response = improved_response
@@ -260,7 +264,7 @@ async def process_chat(
             attempts += 1
 
         else:
-            improvement_error = improved_result.get("error")
+            improvement_error = improved_result.get("failure_reason")
             final_response = improved_result.get("response", final_response)
 
     if attempts >= max_improvement_attempts and response_evaluation.get("improvement_needed"):
@@ -277,16 +281,6 @@ async def process_chat(
         improvement_applied,
     )
 
-    final_quality_start = time.perf_counter()
-    final_quality_gate = evaluate_response(
-        original_prompt=prompt,
-        optimized_prompt=optimized_prompt,
-        response=final_response,
-        prompt_dna=prompt_dna,
-        preferences=saved_preferences,
-    )
-    final_quality_gate_ms = int((time.perf_counter() - final_quality_start) * 1000)
-
     sanitized_response = sanitize_model_output(
         final_response,
         provider=provider_name,
@@ -297,6 +291,16 @@ async def process_chat(
             message="The AI provider returned no usable final answer after sanitization.",
             status_code=502,
         )
+
+    final_quality_start = time.perf_counter()
+    final_quality_gate = evaluate_response(
+        original_prompt=prompt,
+        optimized_prompt=optimized_prompt,
+        response=sanitized_response,
+        prompt_dna=prompt_dna,
+        preferences=saved_preferences,
+    )
+    final_quality_gate_ms = int((time.perf_counter() - final_quality_start) * 1000)
 
     total_ms = int((time.perf_counter() - start_total) * 1000)
 
@@ -315,6 +319,7 @@ async def process_chat(
         "response_evaluation": response_evaluation,
         "improvement_applied": improvement_applied,
         "improvement_attempts": attempts,
+        "improvement_attempted": improvement_attempted,
         "improvement_needed": response_evaluation.get("improvement_needed"),
         "improvement_error": improvement_error,
         "final_quality_gate": final_quality_gate,

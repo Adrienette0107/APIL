@@ -10,6 +10,7 @@ from backend.app.core.config import settings
 from backend.app.core.errors import ProviderExecutionError
 from backend.app.services.ai.base import AIProvider
 
+
 logger = logging.getLogger("apil.ollama")
 
 
@@ -21,30 +22,10 @@ class OllamaProvider(AIProvider):
         self.timeout_seconds = settings.OLLAMA_TIMEOUT_SECONDS
 
     def _get_num_predict(self, prompt: str) -> int:
-        """Choose a generation budget from the request structure, not a giant category map."""
+        """Return the configured provider ceiling when no semantic override exists."""
 
-        prompt_lower = (prompt or "").lower()
-        ceiling = max(256, min(settings.OLLAMA_NUM_PREDICT, 4096))
-
-        if any(phrase in prompt_lower for phrase in ("one sentence", "single sentence", "briefly", "in short", "concise")):
-            return min(256, ceiling)
-
-        if any(phrase in prompt_lower for phrase in ("json", "table", "bullet", "list", "exactly five", "as json")):
-            return min(512, ceiling)
-
-        if any(phrase in prompt_lower for phrase in ("detailed", "in depth", "comprehensive", "step by step", "full explanation", "thoroughly", "architecture")):
-            return min(2048, ceiling)
-
-        if any(phrase in prompt_lower for phrase in ("code", "program", "python", "javascript", "function", "class", "script", "debug", "implementation", "patch")):
-            return min(1536, ceiling)
-
-        if len(prompt) > 2500:
-            return min(2048, ceiling)
-
-        if len(prompt) > 1200:
-            return min(1024, ceiling)
-
-        return min(768, ceiling)
+        del prompt
+        return max(256, settings.OLLAMA_NUM_PREDICT)
 
     async def generate(
         self,
@@ -61,23 +42,27 @@ class OllamaProvider(AIProvider):
             if isinstance(message, dict)
         )
 
-        # Dynamically determine generation length from the request itself rather than a large static keyword list.
-        num_predict = self._get_num_predict(prompt)
+        # Dynamically determine generation length.
+        configured_num_predict = self._get_num_predict(prompt)
+        num_predict = configured_num_predict
 
         options = {
             "num_predict": num_predict,
+            "temperature": temperature,
         }
 
         # Explicit max_tokens from the caller takes priority.
         if max_tokens is not None:
-            options["num_predict"] = max_tokens
+            options["num_predict"] = min(max_tokens, configured_num_predict)
 
         selected_model = model or self.default_model
+
         input_chars = sum(
             len(str(message.get("content", "")))
             for message in messages
             if isinstance(message, dict)
         )
+
         logger.info(
             "Ollama request | model=%s | think=%s | stream=%s | keep_alive=%s | "
             "num_predict=%s | messages=%s | input_chars=%s | input_tokens~=%s",
@@ -90,6 +75,7 @@ class OllamaProvider(AIProvider):
             input_chars,
             (input_chars + 3) // 4,
         )
+
         started = time.perf_counter()
 
         try:
@@ -97,7 +83,7 @@ class OllamaProvider(AIProvider):
                 self.client.chat(
                     model=selected_model,
                     messages=messages,
-                    think=settings.OLLAMA_THINK,
+                    think=False,
                     stream=False,
                     keep_alive=settings.OLLAMA_KEEP_ALIVE,
                     options=options,
@@ -140,6 +126,24 @@ class OllamaProvider(AIProvider):
                 message="The AI provider returned an error.",
             ) from exc
 
+        message = getattr(response, "message", None)
+
+        response_content = None
+        response_thinking = None
+
+        if message is not None:
+            response_content = getattr(message, "content", None)
+            response_thinking = getattr(message, "thinking", None)
+
+        if isinstance(response, dict):
+            raw_message = response.get("message")
+
+            if isinstance(raw_message, dict):
+                response_content = raw_message.get("content")
+                response_thinking = raw_message.get("thinking")
+            elif response_content is None:
+                response_content = response.get("content")
+
         logger.info(
             "Ollama response | model=%s | duration_ms=%s | response_type=%s | "
             "content_chars=%s | thinking_chars=%s | eval_count=%s | "
@@ -147,43 +151,40 @@ class OllamaProvider(AIProvider):
             selected_model,
             int((time.perf_counter() - started) * 1000),
             type(response).__name__,
-            len(getattr(getattr(response, "message", None), "content", None) or ""),
-            len(getattr(getattr(response, "message", None), "thinking", None) or ""),
+            len(response_content or "")
+            if isinstance(response_content, str)
+            else 0,
+            len(response_thinking or "")
+            if isinstance(response_thinking, str)
+            else 0,
             getattr(response, "eval_count", None),
             getattr(response, "prompt_eval_count", None),
             round((getattr(response, "load_duration", 0) or 0) / 1e6),
             round((getattr(response, "eval_duration", 0) or 0) / 1e6),
         )
 
-        # Extract response content.
-        if isinstance(response, dict):
-            message = response.get("message")
-            content = (
-                message.get("content")
-                if isinstance(message, dict)
-                else None
-            )
-        else:
-            message = getattr(response, "message", None)
-            content = getattr(message, "content", None)
+        # Only use the final content.
+        # Never concatenate or return the provider's thinking field.
+        content = response_content
 
-        if not isinstance(content, str) or not content.strip():
-            raise ProviderExecutionError(
-                code="invalid_provider_response",
-                message="The AI provider returned an empty response.",
-            )
+        if not isinstance(content, str):
+            content = ""
 
-        # Remove Qwen3 thinking content if present.
-        if "</think>" in content:
-            content = content.split("</think>", 1)[1].strip()
+        content = content.strip()
 
-        elif "<think>" in content:
-            content = content.split("<think>", 1)[0].strip()
+        # Remove explicit thinking blocks if they appear inside content.
+        if "<think>" in content and "</think>" in content:
+            _, _, content = content.partition("</think>")
+            content = content.strip()
+
+        elif content.startswith("<think>"):
+            content = content.replace("<think>", "", 1).strip()
 
         if not content:
             raise ProviderExecutionError(
-                code="invalid_provider_response",
-                message="The AI provider returned no final answer.",
+                code="empty_provider_response",
+                message="The AI provider returned an empty response.",
+                status_code=502,
             )
 
         return content

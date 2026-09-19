@@ -1,19 +1,11 @@
 from fastapi import HTTPException, Request, Security
-from fastapi.security import (
-    APIKeyHeader,
-    HTTPAuthorizationCredentials,
-    HTTPBearer,
-)
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from backend.app.core.config import settings
 
 
 bearer_scheme = HTTPBearer(
     auto_error=False
-)
-api_key_scheme = APIKeyHeader(
-    name="X-API-Key",
-    auto_error=False,
 )
 
 
@@ -22,17 +14,14 @@ async def verify_api_key(
     credentials: HTTPAuthorizationCredentials | None = Security(
         bearer_scheme
     ),
-    api_key: str | None = Security(api_key_scheme),
 ):
     configured_key = (settings.APIL_API_KEY or "").strip()
+
+    # Authentication disabled when no API key is configured.
     if not configured_key:
         return
 
-    if credentials:
-        token = credentials.credentials.strip()
-    elif api_key:
-        token = api_key.strip()
-    else:
+    if not credentials:
         raise HTTPException(
             status_code=401,
             detail={
@@ -41,6 +30,8 @@ async def verify_api_key(
                 "request_id": request.state.request_id,
             },
         )
+
+    token = credentials.credentials.strip()
 
     if token != configured_key:
         raise HTTPException(

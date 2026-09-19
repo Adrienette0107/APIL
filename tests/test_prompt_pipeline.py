@@ -1,4 +1,5 @@
 import os
+import asyncio
 
 from fastapi.testclient import TestClient
 
@@ -11,6 +12,7 @@ from backend.app.services.response_evaluator import evaluate_response
 from backend.app.services.response_improver import improve_response
 from backend.app.services.response_sanitizer import sanitize_model_output
 from backend.app.services.apil_pipeline import get_generation_budget
+from backend.app.services import response_improver as response_improver_module
 
 
 def test_extract_prompt_dna_for_beginner_explanation():
@@ -171,6 +173,10 @@ def test_sanitizer_returns_empty_for_reasoning_only_output():
     assert sanitize_model_output("<think>private reasoning</think>") == ""
 
 
+def test_sanitizer_removes_common_delimited_reasoning_marker():
+    assert sanitize_model_output("<|begin_of_thought|>private<|end_of_thought|>Final.") == "Final."
+
+
 def test_sanitizer_is_provider_independent():
     content = "<analysis>internal chain</analysis>OpenAI output: here is the answer."
     assert sanitize_model_output(content, provider="openai") == "OpenAI output: here is the answer."
@@ -216,6 +222,23 @@ def test_requirement_driven_evaluator_flags_sort_constraint_violation():
     )
 
 
+def test_requirement_driven_evaluator_flags_reasoning_leakage():
+    prompt = "Explain photosynthesis to a beginner using a simple real-world example."
+    response = (
+        "Okay, the user wants a short explanation.\n"
+        "Let me think about a simple example.\n"
+        "The answer should be clear."
+    )
+    evaluation = evaluate_response(
+        original_prompt=prompt,
+        optimized_prompt=prompt,
+        response=response,
+        prompt_dna=extract_prompt_dna(prompt, {"language": "English", "response_length": "short"}).to_dict(),
+    )
+    assert evaluation["improvement_needed"] is True
+    assert any("reasoning" in issue.lower() for issue in evaluation["issues"])
+
+
 def test_no_unnecessary_improvement_when_response_already_satisfies_request():
     prompt = "Return a single sentence answering: what is the capital of France?"
     dna = extract_prompt_dna(prompt, {"language": "English"}).to_dict()
@@ -250,8 +273,86 @@ def test_improver_attempts_correction_for_json_format_violation():
             model_name="llama3.1",
         )
     )
-    assert result["improvement_applied"] is True or result["response"]
-    assert "{" in result["response"] or "name" in result["response"].lower()
+    assert result["improvement_attempted"] is True
+    assert result["improvement_applied"] is False
+    assert result["response"] == "Alice is 32 years old."
+
+
+def test_improvement_success_sets_applied_true(monkeypatch):
+    class SuccessfulProvider:
+        async def generate(self, **kwargs):
+            return "Improved final answer."
+
+    monkeypatch.setattr(
+        response_improver_module.provider_router,
+        "get_provider",
+        lambda provider: SuccessfulProvider(),
+    )
+    result = asyncio.run(
+        response_improver_module.improve_response(
+            original_prompt="Answer briefly.",
+            optimized_prompt="Answer briefly.",
+            response="Planning text.",
+            evaluation={"improvement_needed": True, "issues": ["planning"]},
+            provider_name="ollama",
+            model_name="qwen3:4b",
+        )
+    )
+    assert result["improvement_attempted"] is True
+    assert result["improvement_applied"] is True
+    assert result["response"] == "Improved final answer."
+
+
+def test_improvement_timeout_preserves_best_response(monkeypatch):
+    class SlowProvider:
+        async def generate(self, **kwargs):
+            await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(
+        response_improver_module.provider_router,
+        "get_provider",
+        lambda provider: SlowProvider(),
+    )
+    monkeypatch.setattr(response_improver_module.settings, "APIL_IMPROVEMENT_TIMEOUT_SECONDS", 0.001)
+    result = asyncio.run(
+        response_improver_module.improve_response(
+            original_prompt="Answer briefly.",
+            optimized_prompt="Answer briefly.",
+            response="Best available answer.",
+            evaluation={"improvement_needed": True, "issues": ["too long"]},
+            provider_name="ollama",
+            model_name="qwen3:4b",
+        )
+    )
+    assert result["improvement_attempted"] is True
+    assert result["improvement_applied"] is False
+    assert result["failure_reason"] == "improvement_timeout"
+    assert result["response"] == "Best available answer."
+
+
+def test_empty_improvement_preserves_best_response(monkeypatch):
+    class EmptyProvider:
+        async def generate(self, **kwargs):
+            return "<think>private reasoning</think>"
+
+    monkeypatch.setattr(
+        response_improver_module.provider_router,
+        "get_provider",
+        lambda provider: EmptyProvider(),
+    )
+    result = asyncio.run(
+        response_improver_module.improve_response(
+            original_prompt="Answer briefly.",
+            optimized_prompt="Answer briefly.",
+            response="Best available answer.",
+            evaluation={"improvement_needed": True, "issues": ["too long"]},
+            provider_name="ollama",
+            model_name="qwen3:4b",
+        )
+    )
+    assert result["improvement_applied"] is False
+    assert result["failure_reason"] == "empty_improvement"
+    assert result["response"] == "Best available answer."
 
 
 def test_diagnostic_endpoint_exposes_full_pipeline_snapshot():

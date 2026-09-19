@@ -64,3 +64,5 @@ class ChatResponse(BaseModel):
     processed_prompt: str | None = None
     provider_call_count: int = 1
     timing: dict | None = None
+    improvement_attempted: bool = False
+    improvement_failure_reason: str | None = None

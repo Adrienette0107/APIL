@@ -37,6 +37,7 @@ class Settings(BaseSettings):
 
     APIL_API_KEY: str | None = None
     APIL_MAX_IMPROVEMENT_ATTEMPTS: int = 1
+    APIL_IMPROVEMENT_TIMEOUT_SECONDS: float = 20.0
     APIL_ENABLE_DEBUG_METADATA: bool = True
 
     RATE_LIMIT_REQUESTS: int = 30
