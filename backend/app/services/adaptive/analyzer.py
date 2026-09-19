@@ -45,19 +45,30 @@ class PromptDNA:
 
 def _infer_language(prompt_lower: str) -> str | None:
     language_patterns = {
-        "spanish": ("en español", "in spanish", "spanish"),
-        "french": ("en français", "in french", "french"),
-        "german": ("in german", "german"),
-        "italian": ("in italian", "italian"),
-        "portuguese": ("in portuguese", "portuguese"),
-        "japanese": ("in japanese", "japanese"),
-        "korean": ("in korean", "korean"),
-        "chinese": ("in chinese", "chinese"),
-        "hindi": ("in hindi", "hindi"),
+        "Spanish": ("en español", "in spanish", "spanish"),
+        "French": ("en français", "in french", "french"),
+        "German": ("in german", "german"),
+        "Italian": ("in italian", "italian"),
+        "Portuguese": ("in portuguese", "portuguese"),
+        "Japanese": ("in japanese", "japanese"),
+        "Korean": ("in korean", "korean"),
+        "Chinese": ("in chinese", "chinese"),
+        "Hindi": ("in hindi", "hindi"),
+        "English": ("in english", "english"),
     }
     for name, patterns in language_patterns.items():
         if any(pattern in prompt_lower for pattern in patterns):
-            return name.title()
+            return name
+    return None
+
+
+def _infer_context(prompt_lower: str) -> str | None:
+    if any(phrase in prompt_lower for phrase in ("for a college project", "college project")):
+        return "college project"
+    if any(phrase in prompt_lower for phrase in ("for my boss", "for work", "professional context")):
+        return "work context"
+    if any(phrase in prompt_lower for phrase in ("for a 10-year-old", "10-year-old", "beginner audience")):
+        return "beginner audience"
     return None
 
 
@@ -95,21 +106,62 @@ def _detect_entities(prompt: str) -> tuple[str, ...]:
     return tuple(unique[:10])
 
 
+def _collect_constraints(prompt_lower: str) -> list[str]:
+    constraints: list[str] = []
+
+    if any(phrase in prompt_lower for phrase in ("without using sort", "do not use sort", "without sort()", "avoid sort")):
+        constraints.append("Do not use sort().")
+    if any(phrase in prompt_lower for phrase in ("briefly", "in short", "short answer", "concise")):
+        constraints.append("Keep the response brief.")
+    if any(phrase in prompt_lower for phrase in ("simple", "plain english", "beginner-friendly", "for a beginner")):
+        constraints.append("Use simple language appropriate for the intended audience.")
+    if any(phrase in prompt_lower for phrase in ("complete runnable code", "runnable code", "must run")):
+        constraints.append("Provide complete runnable code.")
+    if any(phrase in prompt_lower for phrase in ("valid json", "json output", "as json")):
+        constraints.append("Return valid JSON.")
+    if any(phrase in prompt_lower for phrase in ("five bullet points", "in five bullet points")):
+        constraints.append("Give exactly five bullet points.")
+    if any(phrase in prompt_lower for phrase in ("single sentence", "one sentence", "one-sentence")):
+        constraints.append("Return a single sentence.")
+    if any(phrase in prompt_lower for phrase in ("in spanish", "spanish")):
+        constraints.append("Respond in Spanish.")
+
+    for phrase in re.findall(r"(?:do not|don't|never|without|must|should|required)\s+[^.?!]+", prompt_lower):
+        cleaned = phrase.strip()
+        if cleaned and len(cleaned) < 140:
+            constraints.append(cleaned.capitalize())
+
+    return list(dict.fromkeys(constraints))
+
+
 def extract_prompt_dna(
     prompt: str,
     preferences: dict[str, Any] | None = None,
 ) -> PromptDNA:
-    """Extract usable prompt signals without relying on a massive keyword catalog."""
+    """Extract usable prompt requirements without relying on fixed categories or a giant classifier."""
 
     original = prompt.strip()
     if not original:
         raise ValueError("Prompt cannot be empty.")
 
-    analysis = analyze_prompt(original)
     lower = original.lower()
     explicit_preferences = preferences or {}
 
-    intent = analysis.intent
+    intent = "general"
+    code_indicators = ("write code", "create code", "build a program", "implement", "function", "class", "script", "program")
+    if any(match in lower for match in code_indicators):
+        intent = "code_generation"
+    elif any(match in lower for match in ("compare", "versus", "vs", "difference between", "tradeoff")):
+        intent = "comparison"
+    elif any(match in lower for match in ("summarize", "summary", "brief overview")):
+        intent = "summarization"
+    elif any(match in lower for match in ("translate", "translation")):
+        intent = "translation"
+    elif any(match in lower for match in ("explain", "what is", "define", "how does", "why")):
+        intent = "explanation"
+    elif any(match in lower for match in ("solve", "calculate", "find", "debug", "fix", "optimize")):
+        intent = "problem_solving"
+
     task = None
     for verb in (
         "build",
@@ -123,7 +175,8 @@ def extract_prompt_dna(
         "describe",
         "solve",
         "debug",
-        "classify",
+        "design",
+        "plan",
         "analyze",
         "find",
     ):
@@ -131,22 +184,11 @@ def extract_prompt_dna(
             task = verb
             break
 
-    if task is None and intent == "code_generation":
-        task = "build"
-
     subject = _extract_subject(original, task)
     if not subject:
         subject = original
 
-    context = None
-    if "for a college project" in lower or "college project" in lower:
-        context = "college project"
-    elif "for my boss" in lower or "for work" in lower:
-        context = "work context"
-    elif "for a 10-year-old" in lower or "10-year-old" in lower:
-        context = "beginner audience"
-
-    audience = explicit_preferences.get("level") or None
+    audience = explicit_preferences.get("level")
     if audience is None:
         for label in ("beginner", "intermediate", "advanced"):
             if label in lower:
@@ -155,7 +197,6 @@ def extract_prompt_dna(
         if audience is None and re.search(r"\b\d+\s*-?year-old\b|\bchild\b|\bteen\b", lower):
             audience = "beginner"
 
-    expertise_level = audience
     language = explicit_preferences.get("language") or _infer_language(lower)
     tone = None
     for candidate in ("formal", "casual", "friendly", "professional", "neutral"):
@@ -167,52 +208,35 @@ def extract_prompt_dna(
     if desired_depth is None:
         if any(phrase in lower for phrase in ("simple", "easy", "plain english", "beginner-friendly")):
             desired_depth = "simple"
-        elif any(phrase in lower for phrase in ("step by step", "detailed", "thoroughly", "in depth")):
+        elif any(phrase in lower for phrase in ("step by step", "detailed", "thoroughly", "in depth", "deeply")):
             desired_depth = "detailed"
 
     desired_length = explicit_preferences.get("response_length")
     if desired_length is None:
-        if any(phrase in lower for phrase in ("briefly", "short answer", "in short", "concise")):
+        if any(phrase in lower for phrase in ("briefly", "short answer", "in short", "concise", "one sentence")):
             desired_length = "short"
         elif any(phrase in lower for phrase in ("detailed", "comprehensive", "long-form", "in depth")):
             desired_length = "long"
 
     output_format = None
-    if "example" in lower and intent == "explanation":
+    if any(phrase in lower for phrase in ("single sentence", "one sentence", "one-sentence")):
+        output_format = "single sentence"
+    if output_format is None and "example" in lower and intent == "explanation":
         output_format = "explanation + example"
-    for format_name, marker in (
-        ("bullet points", ("bullet points", "bullets", "bullet list", "five bullet points")),
-        ("steps", ("step by step", "steps", "procedure")),
+    for format_name, markers in (
+        ("json", ("json", "valid json", "as json")),
+        ("bullet points", ("bullet points", "bullets", "bullet list", "list of items")),
         ("table", ("table", "comparison table")),
-        ("json", ("json", "json output")),
+        ("steps", ("step by step", "steps", "procedure", "workflow")),
         ("code", ("code", "program", "script", "runnable code")),
-        ("essay", ("essay", "paragraph", "write an essay")),
         ("summary", ("summary", "summarize")),
+        ("essay", ("essay", "paragraph", "prose")),
     ):
-        if output_format is None and any(item in lower for item in marker):
+        if output_format is None and any(marker in lower for marker in markers):
             output_format = format_name
             break
 
-    constraints: list[str] = []
-    if "without using sort" in lower or "do not use sort" in lower or "without sort()" in lower:
-        constraints.append("Do not use sort().")
-    if "briefly" in lower or "brief" in lower:
-        constraints.append("Keep the response brief.")
-    if "simple" in lower or "plain english" in lower or "beginner-friendly" in lower:
-        constraints.append("Use simple language appropriate for a beginner.")
-    if "complete runnable code" in lower or "runnable code" in lower:
-        constraints.append("Provide complete runnable code.")
-    if "do not" in lower:
-        for phrase in re.findall(r"do not\s+[^.?!]+", lower):
-            constraints.append(f"Do not {phrase.replace('do not ', '').strip()}.")
-    if "without" in lower:
-        for phrase in re.findall(r"without\s+[^.?!]+", lower):
-            constraints.append(f"Without {phrase.replace('without ', '').strip()}.")
-    if "in five bullet points" in lower:
-        constraints.append("Give exactly five bullet points.")
-    if "in spanish" in lower:
-        constraints.append("Respond in Spanish.")
-
+    constraints = _collect_constraints(lower)
     requirements = list(constraints)
     if output_format:
         requirements.append(f"Use {output_format} format.")
@@ -220,6 +244,8 @@ def extract_prompt_dna(
         requirements.append(f"Keep the response {desired_length} in length.")
     if audience:
         requirements.append(f"Tailor the response for a {audience} audience.")
+    if language:
+        requirements.append(f"Respond in {language}.")
 
     code_requirements: list[str] = []
     if any(token in lower for token in ("python", "javascript", "code", "program", "script", "function")):
@@ -233,18 +259,15 @@ def extract_prompt_dna(
     missing_information: list[str] = []
     assumptions: list[str] = []
     ambiguity = "low"
-    if not task or not subject or len(original.split()) < 4:
+    if (not task or not subject) and len(original.split()) < 4:
         ambiguity = "medium"
         missing_information.append("The task is underspecified.")
-    if intent == "code_generation" and ("something useful" in lower or "something" in lower):
+    if "something useful" in lower or ("something" in lower and "build" in lower):
         ambiguity = "medium"
         missing_information.append("The exact deliverable and success criteria are not specified.")
-    if not output_format and intent in {"comparison", "summarization", "translation"}:
+    if not output_format and not constraints and len(original.split()) >= 6 and not "?" in original:
         ambiguity = "medium"
         missing_information.append("The preferred output shape is not explicit.")
-    if intent == "general" and len(original.split()) > 3:
-        ambiguity = "medium"
-        missing_information.append("The user request may need clarification to confirm the exact task.")
 
     special_instructions = []
     for phrase in re.findall(r"(?:do not|without|must|should|required)\s+[^.?!]+", lower):
@@ -256,10 +279,10 @@ def extract_prompt_dna(
         task=task,
         subject=subject,
         topic=subject,
-        domain=analysis.domain,
-        context=context,
+        domain="general",
+        context=_infer_context(lower),
         audience=audience,
-        expertise_level=expertise_level,
+        expertise_level=audience,
         language=language,
         tone=tone,
         desired_depth=desired_depth,
@@ -280,25 +303,21 @@ def extract_prompt_dna(
 
 
 def analyze_prompt(prompt: str) -> PromptAnalysis:
-
     prompt_lower = prompt.lower()
     word_count = len(prompt.split())
 
-    if any(word in prompt_lower for word in ["write", "create", "generate", "draft", "compose", "build", "implement"]) or (
-        any(word in prompt_lower for word in ["python", "javascript", "code", "program", "function", "class"]) and any(word in prompt_lower for word in ["build", "write", "create", "generate"])):
-        intent = "code_generation"
-    elif any(word in prompt_lower for word in ["compare", "difference", "versus", "vs", "tradeoff", "pros and cons"]):
-        intent = "comparison"
-    elif any(word in prompt_lower for word in ["summarize", "summary", "brief overview", "condense"]):
-        intent = "summarization"
-    elif any(word in prompt_lower for word in ["translate", "translation"]):
-        intent = "translation"
-    elif any(word in prompt_lower for word in ["explain", "what is", "define", "meaning", "how does", "why"]):
-        intent = "explanation"
-    elif any(word in prompt_lower for word in ["solve", "calculate", "find", "debug", "fix", "optimize"]):
-        intent = "problem_solving"
-    else:
-        intent = "general"
+    intent = "general"
+    for candidate, matches in (
+        ("code_generation", ("write code", "python", "javascript", "script", "function", "class", "program")),
+        ("comparison", ("compare", "versus", "vs", "difference between", "tradeoff")),
+        ("summarization", ("summarize", "summary", "brief overview")),
+        ("translation", ("translate", "translation")),
+        ("explanation", ("explain", "what is", "define", "how does", "why")),
+        ("problem_solving", ("solve", "calculate", "find", "debug", "fix", "optimize")),
+    ):
+        if any(match in prompt_lower for match in matches):
+            intent = candidate
+            break
 
     if word_count < 15:
         complexity = "low"
@@ -307,21 +326,20 @@ def analyze_prompt(prompt: str) -> PromptAnalysis:
     else:
         complexity = "high"
 
-    if any(word in prompt_lower for word in ["python", "javascript", "typescript", "sql", "database", "api", "software", "program", "code", "server", "frontend"]):
+    if any(word in prompt_lower for word in ("python", "javascript", "typescript", "sql", "database", "api", "software", "server", "frontend")):
         domain = "technology"
-    elif any(word in prompt_lower for word in ["math", "calculate", "equation", "algebra", "statistics", "probability"]):
+    elif any(word in prompt_lower for word in ("math", "calculate", "equation", "algebra", "statistics", "probability")):
         domain = "mathematics"
-    elif any(word in prompt_lower for word in ["biology", "chemistry", "physics", "medicine", "health"]):
+    elif any(word in prompt_lower for word in ("biology", "chemistry", "physics", "medicine", "health")):
         domain = "science"
-    elif any(word in prompt_lower for word in ["history", "politics", "economics", "literature", "philosophy"]):
+    elif any(word in prompt_lower for word in ("history", "politics", "economics", "literature", "philosophy")):
         domain = "humanities"
     else:
         domain = "general"
 
-    output_type = intent
     return PromptAnalysis(
         intent=intent,
         complexity=complexity,
         domain=domain,
-        output_type=output_type,
+        output_type=intent,
     )

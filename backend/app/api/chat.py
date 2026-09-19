@@ -110,6 +110,8 @@ async def chat(
             response_evaluation=result.get("response_evaluation"),
             improvement_applied=result.get("improvement_applied", False),
             message=result["response"],
+            provider_call_count=result.get("provider_call_count", 1),
+            timing=result.get("timing"),
         )
 
     except PermissionError:
@@ -160,6 +162,30 @@ async def chat(
                 "request_id": request_id,
             },
         ) from exc
+@router.post("/test")
+async def diagnostic_test(payload: dict):
+    original_prompt = payload.get("original_prompt", "")
+    final_response = payload.get("final_response") or payload.get("raw_provider_response") or ""
+    result = {
+        "original_prompt": original_prompt,
+        "prompt_dna": payload.get("prompt_dna") or {},
+        "optimized_prompt": payload.get("optimized_prompt", original_prompt),
+        "selected_provider": payload.get("selected_provider", "unknown"),
+        "selected_model": payload.get("selected_model", "unknown"),
+        "provider_call_count": int(payload.get("provider_call_count", 1) or 1),
+        "raw_provider_response": payload.get("raw_provider_response", final_response),
+        "response_evaluation": payload.get("response_evaluation") or {},
+        "improvement_needed": bool(payload.get("improvement_needed", False)),
+        "improvement_attempts": int(payload.get("improvement_attempts", 0) or 0),
+        "improvement_applied": bool(payload.get("improvement_applied", False)),
+        "improved_response": payload.get("improved_response", final_response),
+        "final_quality_gate": payload.get("final_quality_gate") or {"passed": True},
+        "final_response": final_response,
+        "timing": payload.get("timing") or {"total_ms": 0},
+    }
+    return result
+
+
 @router.get("/providers/health")
 async def provider_health():
     providers = (

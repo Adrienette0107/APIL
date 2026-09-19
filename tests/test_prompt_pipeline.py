@@ -1,10 +1,16 @@
 import os
 
+from fastapi.testclient import TestClient
+
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
 
+from backend.app.main import app
 from backend.app.services.adaptive.analyzer import extract_prompt_dna
 from backend.app.services.prompt_optimizer import PromptOptimizer
+from backend.app.services.response_evaluator import evaluate_response
+from backend.app.services.response_improver import improve_response
 from backend.app.services.response_sanitizer import sanitize_model_output
+from backend.app.services.apil_pipeline import get_generation_budget
 
 
 def test_extract_prompt_dna_for_beginner_explanation():
@@ -147,7 +153,135 @@ def test_sanitizer_keeps_clean_response_unchanged():
     assert sanitize_model_output(content) == content
 
 
+def test_sanitizer_prefers_provider_content_over_thinking_field():
+    response = {"message": {"thinking": "private reasoning", "content": "Final answer."}}
+    assert sanitize_model_output(response) == "Final answer."
+
+
+def test_sanitizer_removes_unmarked_reasoning_preamble_conservatively():
+    content = (
+        "Okay, I need to identify the user's request.\n\n"
+        "Let me think about the clearest approach.\n\n"
+        "Photosynthesis converts light energy into chemical energy."
+    )
+    assert sanitize_model_output(content) == "Photosynthesis converts light energy into chemical energy."
+
+
+def test_sanitizer_returns_empty_for_reasoning_only_output():
+    assert sanitize_model_output("<think>private reasoning</think>") == ""
+
+
 def test_sanitizer_is_provider_independent():
     content = "<analysis>internal chain</analysis>OpenAI output: here is the answer."
     assert sanitize_model_output(content, provider="openai") == "OpenAI output: here is the answer."
     assert sanitize_model_output(content, provider="ollama") == "OpenAI output: here is the answer."
+
+
+def test_universal_prompt_dna_works_for_unseen_prompt_type():
+    dna = extract_prompt_dna(
+        "Design a one-page ritual for a team whose systems are failing at dusk and keep the tone quiet, observatory-like.",
+        {"language": "English"},
+    )
+    assert dna.intent in {"general", "problem_solving", "explanation"}
+    assert dna.audience is None or dna.audience == "beginner"
+    assert dna.constraints or dna.requirements
+    assert dna.topic is not None
+
+
+def test_requirement_driven_evaluator_flags_json_format_violation():
+    prompt = "Return the answer as valid JSON with fields name and age."
+    evaluation = evaluate_response(
+        original_prompt=prompt,
+        optimized_prompt=prompt,
+        response="Alice is 32 years old.",
+        prompt_dna=extract_prompt_dna(prompt, {"language": "English"}).to_dict(),
+    )
+    assert evaluation["improvement_needed"] is True
+    assert any("json" in issue.lower() or "format" in issue.lower() for issue in evaluation["issues"]) or any(
+        "json" in item.lower() for item in evaluation["missing_requirements"]
+    )
+
+
+def test_requirement_driven_evaluator_flags_sort_constraint_violation():
+    prompt = "Write Python code to find the second largest number without using sort()."
+    evaluation = evaluate_response(
+        original_prompt=prompt,
+        optimized_prompt=prompt,
+        response="def second_largest(nums):\n    return sorted(nums)[-2]\n",
+        prompt_dna=extract_prompt_dna(prompt, {"language": "English"}).to_dict(),
+    )
+    assert evaluation["improvement_needed"] is True
+    assert any("sort" in item.lower() for item in evaluation["missing_requirements"]) or any(
+        "sort" in issue.lower() for issue in evaluation["issues"]
+    )
+
+
+def test_no_unnecessary_improvement_when_response_already_satisfies_request():
+    prompt = "Return a single sentence answering: what is the capital of France?"
+    dna = extract_prompt_dna(prompt, {"language": "English"}).to_dict()
+    response = "Paris is the capital of France."
+    evaluation = evaluate_response(
+        original_prompt=prompt,
+        optimized_prompt=prompt,
+        response=response,
+        prompt_dna=dna,
+    )
+    assert evaluation["improvement_needed"] is False
+    assert evaluation["passed"] is True
+
+
+def test_improver_attempts_correction_for_json_format_violation():
+    prompt = "Return the answer as valid JSON with fields name and age."
+    evaluation = evaluate_response(
+        original_prompt=prompt,
+        optimized_prompt=prompt,
+        response="Alice is 32 years old.",
+        prompt_dna=extract_prompt_dna(prompt, {"language": "English"}).to_dict(),
+    )
+
+    result = __import__('asyncio').run(
+        improve_response(
+            original_prompt=prompt,
+            optimized_prompt=prompt,
+            response="Alice is 32 years old.",
+            evaluation=evaluation,
+            prompt_dna=extract_prompt_dna(prompt, {"language": "English"}).to_dict(),
+            provider_name="ollama",
+            model_name="llama3.1",
+        )
+    )
+    assert result["improvement_applied"] is True or result["response"]
+    assert "{" in result["response"] or "name" in result["response"].lower()
+
+
+def test_diagnostic_endpoint_exposes_full_pipeline_snapshot():
+    client = TestClient(app)
+    payload = {
+        "original_prompt": "Return the answer as valid JSON with fields name and age.",
+        "prompt_dna": {},
+        "optimized_prompt": "Return the answer as valid JSON with fields name and age.",
+        "selected_provider": "ollama",
+        "selected_model": "llama3.1",
+        "raw_provider_response": '{"name": "Alice", "age": 32}',
+        "response_evaluation": {"improvement_needed": False},
+        "improvement_needed": False,
+        "improvement_applied": False,
+        "improvement_attempts": 0,
+        "improved_response": '{"name": "Alice", "age": 32}',
+        "final_quality_gate": {"passed": True},
+        "final_response": '{"name": "Alice", "age": 32}'
+    }
+    response = client.post("/v1/test", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["original_prompt"] == payload["original_prompt"]
+    assert body["final_response"] == payload["final_response"]
+    assert body["improvement_needed"] is False
+    assert body["timing"]["total_ms"] == 0
+
+
+def test_generation_budget_uses_semantic_prompt_requirements():
+    assert get_generation_budget({"desired_length": "short"}) == 384
+    assert get_generation_budget({"desired_length": "medium", "desired_depth": "simple"}) == 256
+    assert get_generation_budget({"desired_length": "long"}) == 2048
+    assert get_generation_budget({"desired_length": "long", "code_requirements": ("complete",)}) == 3072

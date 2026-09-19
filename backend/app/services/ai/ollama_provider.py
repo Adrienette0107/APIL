@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import time
 from typing import Any
 
 import httpx
@@ -7,6 +9,8 @@ from ollama import AsyncClient
 from backend.app.core.config import settings
 from backend.app.core.errors import ProviderExecutionError
 from backend.app.services.ai.base import AIProvider
+
+logger = logging.getLogger("apil.ollama")
 
 
 class OllamaProvider(AIProvider):
@@ -17,62 +21,30 @@ class OllamaProvider(AIProvider):
         self.timeout_seconds = settings.OLLAMA_TIMEOUT_SECONDS
 
     def _get_num_predict(self, prompt: str) -> int:
-        """
-        Dynamically determine the maximum number of generated tokens
-        based on the complexity and expected output type of the prompt.
-        """
+        """Choose a generation budget from the request structure, not a giant category map."""
 
-        prompt_lower = prompt.lower()
+        prompt_lower = (prompt or "").lower()
+        ceiling = max(256, min(settings.OLLAMA_NUM_PREDICT, 4096))
 
-        # Code / programming requests generally need more output.
-        code_keywords = [
-            "code",
-            "program",
-            "python",
-            "javascript",
-            "java",
-            "c++",
-            "api",
-            "function",
-            "class",
-            "implement",
-            "build",
-            "debug",
-            "sql",
-            "html",
-            "css",
-            "react",
-            "fastapi",
-        ]
+        if any(phrase in prompt_lower for phrase in ("one sentence", "single sentence", "briefly", "in short", "concise")):
+            return min(256, ceiling)
 
-        # Detailed requests need more generation space.
-        detailed_keywords = [
-            "detailed",
-            "in detail",
-            "comprehensive",
-            "step by step",
-            "deep explanation",
-            "explain everything",
-            "thoroughly",
-            "architecture",
-            "complete",
-        ]
+        if any(phrase in prompt_lower for phrase in ("json", "table", "bullet", "list", "exactly five", "as json")):
+            return min(512, ceiling)
 
-        if any(keyword in prompt_lower for keyword in code_keywords):
-            return 8192
+        if any(phrase in prompt_lower for phrase in ("detailed", "in depth", "comprehensive", "step by step", "full explanation", "thoroughly", "architecture")):
+            return min(2048, ceiling)
 
-        if any(keyword in prompt_lower for keyword in detailed_keywords):
-            return 8192
+        if any(phrase in prompt_lower for phrase in ("code", "program", "python", "javascript", "function", "class", "script", "debug", "implementation", "patch")):
+            return min(1536, ceiling)
 
-        # Long prompts can indicate more complex tasks.
-        if len(prompt) > 3000:
-            return 8192
+        if len(prompt) > 2500:
+            return min(2048, ceiling)
 
-        if len(prompt) > 1000:
-            return 6144
+        if len(prompt) > 1200:
+            return min(1024, ceiling)
 
-        # Normal questions.
-        return 4096
+        return min(768, ceiling)
 
     async def generate(
         self,
@@ -89,26 +61,44 @@ class OllamaProvider(AIProvider):
             if isinstance(message, dict)
         )
 
-        # Dynamically determine generation length.
-        
+        # Dynamically determine generation length from the request itself rather than a large static keyword list.
         num_predict = self._get_num_predict(prompt)
 
         options = {
             "num_predict": num_predict,
-}
+        }
 
         # Explicit max_tokens from the caller takes priority.
         if max_tokens is not None:
             options["num_predict"] = max_tokens
 
         selected_model = model or self.default_model
+        input_chars = sum(
+            len(str(message.get("content", "")))
+            for message in messages
+            if isinstance(message, dict)
+        )
+        logger.info(
+            "Ollama request | model=%s | think=%s | stream=%s | keep_alive=%s | "
+            "num_predict=%s | messages=%s | input_chars=%s | input_tokens~=%s",
+            selected_model,
+            settings.OLLAMA_THINK,
+            False,
+            settings.OLLAMA_KEEP_ALIVE,
+            options["num_predict"],
+            len(messages),
+            input_chars,
+            (input_chars + 3) // 4,
+        )
+        started = time.perf_counter()
 
         try:
             response = await asyncio.wait_for(
                 self.client.chat(
                     model=selected_model,
                     messages=messages,
-                    think=False,
+                    think=settings.OLLAMA_THINK,
+                    stream=False,
                     keep_alive=settings.OLLAMA_KEEP_ALIVE,
                     options=options,
                 ),
@@ -149,6 +139,21 @@ class OllamaProvider(AIProvider):
                 code="provider_error",
                 message="The AI provider returned an error.",
             ) from exc
+
+        logger.info(
+            "Ollama response | model=%s | duration_ms=%s | response_type=%s | "
+            "content_chars=%s | thinking_chars=%s | eval_count=%s | "
+            "prompt_eval_count=%s | load_duration_ms=%s | eval_duration_ms=%s",
+            selected_model,
+            int((time.perf_counter() - started) * 1000),
+            type(response).__name__,
+            len(getattr(getattr(response, "message", None), "content", None) or ""),
+            len(getattr(getattr(response, "message", None), "thinking", None) or ""),
+            getattr(response, "eval_count", None),
+            getattr(response, "prompt_eval_count", None),
+            round((getattr(response, "load_duration", 0) or 0) / 1e6),
+            round((getattr(response, "eval_duration", 0) or 0) / 1e6),
+        )
 
         # Extract response content.
         if isinstance(response, dict):

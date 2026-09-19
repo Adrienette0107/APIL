@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +37,34 @@ output_verifier = OutputVerifier()
 max_improvement_attempts = getattr(settings, "APIL_MAX_IMPROVEMENT_ATTEMPTS", 1)
 
 
+def get_generation_budget(
+    prompt_dna: dict,
+    preferences: dict | None = None,
+) -> int:
+    """Derive a bounded output budget from semantic request requirements."""
+
+    preferences = preferences or {}
+    length = (
+        prompt_dna.get("desired_length")
+        or prompt_dna.get("response_length")
+        or preferences.get("response_length")
+    )
+    output_format = prompt_dna.get("output_format")
+    has_code = bool(prompt_dna.get("code_requirements")) or output_format == "code"
+
+    if length == "short" or output_format == "single sentence":
+        return 384
+    if has_code:
+        return 3072 if length == "long" else 2048
+    if length == "long" or prompt_dna.get("desired_depth") == "detailed":
+        return 2048
+    if output_format in {"json", "table", "bullet points", "steps", "summary"}:
+        return 768
+    if prompt_dna.get("desired_depth") == "simple":
+        return 256
+    return 768
+
+
 async def process_chat(
     db: AsyncSession,
     prompt: str,
@@ -45,6 +74,8 @@ async def process_chat(
     preferences: dict | None = None,
     request_id: str | None = None,
 ):
+
+    start_total = time.perf_counter()
 
     saved_preferences = await get_user_preferences(
         db=db,
@@ -61,10 +92,12 @@ async def process_chat(
         limit=20,
     )
 
+    prompt_start = time.perf_counter()
     optimization_result = prompt_optimizer.optimize(
         prompt=prompt,
         preferences=saved_preferences,
     )
+    prompt_processing_ms = int((time.perf_counter() - prompt_start) * 1000)
 
     optimized_prompt = optimization_result["optimized_prompt"]
     prompt_dna = optimization_result["prompt_dna"]
@@ -100,19 +133,28 @@ async def process_chat(
     )
 
     provider = provider_router.get_provider(provider_name)
+    generation_budget = get_generation_budget(
+        prompt_dna,
+        saved_preferences,
+    )
 
     logger.info(
-        "Sending optimized prompt to provider | request_id=%s | provider=%s | model=%s",
+        "Sending optimized prompt to provider | request_id=%s | provider=%s | model=%s | max_tokens=%s",
         request_id,
         provider_name,
         selected_model,
+        generation_budget,
     )
 
+    provider_call_count = 0
+    provider_start = time.perf_counter()
     try:
         response = await provider.generate(
             messages=messages,
             model=selected_model,
+            max_tokens=generation_budget,
         )
+        provider_call_count = 1
     except ProviderExecutionError:
         raise
     except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
@@ -126,6 +168,7 @@ async def process_chat(
             code="provider_error",
             message="The AI provider returned an error.",
         ) from exc
+    provider_generation_ms = int((time.perf_counter() - provider_start) * 1000)
 
     logger.info(
         "Provider response received | request_id=%s | provider=%s | model=%s",
@@ -135,7 +178,20 @@ async def process_chat(
     )
 
     raw_response = response
-    response = process_response(response=raw_response, preferences=saved_preferences)
+    sanitized_provider_response = sanitize_model_output(
+        raw_response,
+        provider=provider_name,
+    )
+    if not sanitized_provider_response:
+        raise ProviderExecutionError(
+            code="invalid_provider_response",
+            message="The AI provider returned no usable final answer.",
+            status_code=502,
+        )
+    response = process_response(
+        response=sanitized_provider_response,
+        preferences=saved_preferences,
+    )
 
     verification_result = output_verifier.verify(
         original_prompt=prompt,
@@ -143,6 +199,7 @@ async def process_chat(
         preferences=saved_preferences,
     )
 
+    evaluation_start = time.perf_counter()
     try:
         response_evaluation = evaluate_response(
             original_prompt=prompt,
@@ -169,13 +226,16 @@ async def process_chat(
             "improvement_needed": False,
             "improvement_instructions": [],
         }
+    response_evaluation_ms = int((time.perf_counter() - evaluation_start) * 1000)
 
     improvement_applied = False
     final_response = response
     improvement_error = None
     attempts = 0
+    improvement_ms = 0
 
-    while response_evaluation.get("improvement_needed") and attempts < max_improvement_attempts:
+    if response_evaluation.get("improvement_needed") and attempts < max_improvement_attempts:
+        improvement_start = time.perf_counter()
         improved_result = await improve_response(
             original_prompt=prompt,
             optimized_prompt=optimized_prompt,
@@ -185,6 +245,7 @@ async def process_chat(
             provider_name=provider_name,
             model_name=selected_model,
         )
+        improvement_ms += int((time.perf_counter() - improvement_start) * 1000)
         if improved_result.get("improvement_applied"):
             improved_response = improved_result["response"]
             final_response = improved_response
@@ -197,11 +258,10 @@ async def process_chat(
                 preferences=saved_preferences,
             )
             attempts += 1
-            continue
 
-        improvement_error = improved_result.get("error")
-        final_response = improved_result.get("response", final_response)
-        break
+        else:
+            improvement_error = improved_result.get("error")
+            final_response = improved_result.get("response", final_response)
 
     if attempts >= max_improvement_attempts and response_evaluation.get("improvement_needed"):
         logger.info(
@@ -217,9 +277,28 @@ async def process_chat(
         improvement_applied,
     )
 
-    sanitized_response = sanitize_model_output(final_response)
+    final_quality_start = time.perf_counter()
+    final_quality_gate = evaluate_response(
+        original_prompt=prompt,
+        optimized_prompt=optimized_prompt,
+        response=final_response,
+        prompt_dna=prompt_dna,
+        preferences=saved_preferences,
+    )
+    final_quality_gate_ms = int((time.perf_counter() - final_quality_start) * 1000)
+
+    sanitized_response = sanitize_model_output(
+        final_response,
+        provider=provider_name,
+    )
     if not sanitized_response:
-        sanitized_response = "I’m sorry, but I couldn’t generate a final answer."
+        raise ProviderExecutionError(
+            code="invalid_provider_response",
+            message="The AI provider returned no usable final answer after sanitization.",
+            status_code=502,
+        )
+
+    total_ms = int((time.perf_counter() - start_total) * 1000)
 
     return {
         "provider": provider_name,
@@ -228,12 +307,26 @@ async def process_chat(
         "optimized_prompt": optimized_prompt,
         "prompt_dna": prompt_dna,
         "processed_prompt": processed_prompt,
+        "raw_provider_response": raw_response,
         "raw_response": raw_response,
         "response": sanitized_response,
+        "provider_call_count": provider_call_count,
         "verification": verification_result,
         "response_evaluation": response_evaluation,
         "improvement_applied": improvement_applied,
+        "improvement_attempts": attempts,
+        "improvement_needed": response_evaluation.get("improvement_needed"),
         "improvement_error": improvement_error,
+        "final_quality_gate": final_quality_gate,
+        "final_response": sanitized_response,
+        "timing": {
+            "prompt_processing_ms": prompt_processing_ms,
+            "provider_generation_ms": provider_generation_ms,
+            "response_evaluation_ms": response_evaluation_ms,
+            "response_improvement_ms": improvement_ms,
+            "final_quality_gate_ms": final_quality_gate_ms,
+            "total_ms": total_ms,
+        },
         "preferences": saved_preferences,
         "analysis": {
             "intent": analysis.intent,

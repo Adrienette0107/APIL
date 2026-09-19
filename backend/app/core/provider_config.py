@@ -61,12 +61,12 @@ def get_provider_configs() -> dict[str, ProviderConfig]:
                 "qwen3:4b",
             ),
             timeout=_get_float(
-                "OLLAMA_TIMEOUT",
-                120.0,
+                "OLLAMA_TIMEOUT_SECONDS",
+                _get_float("OLLAMA_TIMEOUT", 600.0),
             ),
             max_retries=_get_int(
                 "OLLAMA_MAX_RETRIES",
-                2,
+                1,
             ),
             priority=_get_int(
                 "OLLAMA_PRIORITY",
