@@ -2,25 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable
 
+from backend.app.core.errors import ProviderExecutionError
 from backend.app.core.provider_config import (
     ProviderConfig,
     get_provider_configs,
 )
-from backend.app.services.circuit_breaker import (
-    CircuitBreaker,
-    CircuitState,
-)
-
+from backend.app.services.circuit_breaker import CircuitBreaker
 from backend.app.services.provider_runtime import (
-    circuit_breaker,
-)
-
-from backend.app.services.provider_runtime import (
-    circuit_breaker,
+    shared_circuit_breaker,
 )
 
 logger = logging.getLogger("apil.provider_executor")
@@ -28,6 +20,10 @@ logger = logging.getLogger("apil.provider_executor")
 
 @dataclass
 class ProviderExecutionResult:
+    """
+    Normalized result returned by ProviderExecutor.
+    """
+
     provider: str
     model: str
     content: str
@@ -35,92 +31,103 @@ class ProviderExecutionResult:
     attempts: int = 1
 
 
-class ProviderExecutionError(Exception):
+class ProviderExecutor:
     """
-    Standard APIL provider execution error.
+    Central execution layer for all AI providers.
+
+    Responsibilities:
+        - provider configuration validation
+        - timeout protection
+        - retry handling
+        - exponential backoff
+        - circuit breaker integration
+        - provider error normalization
+        - response normalization
+        - attempt tracking
+
+    Provider-specific SDK logic stays inside provider adapters.
+
+    Architecture:
+
+        APIL Pipeline
+              ↓
+        ProviderFallbackManager
+              ↓
+        ProviderExecutor
+              ↓
+        AIProvider adapter
+              ↓
+        OpenAI / Gemini / Anthropic / Groq / Ollama
     """
 
     def __init__(
         self,
-        provider: str,
-        message: str,
-        *,
-        category: str = "provider_error",
-        retryable: bool = False,
-        attempts: int = 1,
-    ):
-        self.provider = provider
-        self.category = category
-        self.retryable = retryable
-        self.attempts = attempts
+        configs: dict[str, ProviderConfig] | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
+    ) -> None:
 
-        super().__init__(message)
-
-
-class ProviderExecutor:
-    """
-    Central execution layer for APIL providers.
-
-    Responsibilities:
-    - Provider configuration
-    - Timeout
-    - Retry
-    - Exponential backoff
-    - Circuit breaker
-    - Error normalization
-    - Structured logging
-
-    Provider-specific API logic remains inside adapters.
-    """
-
-    def __init__(self) -> None:
-        self.configs = get_provider_configs()
-
-        self.circuit_breaker = CircuitBreaker(
-    failure_threshold=int(
-        os.getenv(
-            "APIL_CIRCUIT_FAILURE_THRESHOLD",
-            "3",
+        self.configs = (
+            configs
+            if configs is not None
+            else get_provider_configs()
         )
-    ),
-    recovery_timeout=float(
-        os.getenv(
-            "APIL_CIRCUIT_RECOVERY_TIMEOUT",
-            "30",
+
+        # Use the shared process-level circuit breaker.
+        #
+        # This is important. Creating a new breaker for every
+        # request would destroy circuit-breaker state.
+        self.circuit_breaker = (
+            circuit_breaker
+            if circuit_breaker is not None
+            else shared_circuit_breaker
         )
-    ),
-)
+
+    # ==================================================================
+    # PROVIDER CONFIGURATION
+    # ==================================================================
 
     def get_config(
         self,
         provider: str,
     ) -> ProviderConfig:
 
+        provider = (
+            provider.strip().lower()
+            if provider
+            else ""
+        )
+
         config = self.configs.get(provider)
 
         if config is None:
             raise ProviderExecutionError(
-                provider=provider,
+                code="provider_not_registered",
                 message=(
-                    f"Provider '{provider}' "
-                    "is not registered."
+                    f"Provider '{provider}' is not registered."
                 ),
-                category="unsupported_provider",
+                status_code=502,
+                provider=provider,
+                category="provider_not_registered",
                 retryable=False,
             )
 
         if not config.enabled:
             raise ProviderExecutionError(
-                provider=provider,
+                code="provider_disabled",
                 message=(
-                    f"Provider '{provider}' "
-                    "is disabled."
+                    f"Provider '{provider}' is disabled."
                 ),
+                status_code=503,
+                provider=provider,
                 category="provider_disabled",
                 retryable=False,
             )
 
         return config
+
+    # ==================================================================
+    # MAIN EXECUTION
+    # ==================================================================
 
     async def execute(
         self,
@@ -131,65 +138,161 @@ class ProviderExecutor:
             Awaitable[Any],
         ],
     ) -> ProviderExecutionResult:
+        """
+        Execute a provider operation with timeout, retry and
+        circuit-breaker protection.
+
+        Parameters
+        ----------
+        provider:
+            Provider name, e.g. "ollama", "openai".
+
+        model:
+            Provider-specific model name.
+
+        operation:
+            Async callable that performs the actual provider request.
+
+        Returns
+        -------
+        ProviderExecutionResult
+        """
+
+        provider = (
+            provider.strip().lower()
+            if provider
+            else ""
+        )
+
+        model = (
+            model.strip()
+            if model
+            else ""
+        )
 
         config = self.get_config(provider)
 
-        # Check circuit breaker before making
-        # a request to the provider.
+        # --------------------------------------------------------------
+        # Circuit breaker
+        # --------------------------------------------------------------
+
         if not self.circuit_breaker.allow_request(
             provider
         ):
+            logger.warning(
+                "provider_circuit_open",
+                extra={
+                    "provider": provider,
+                    "model": model,
+                },
+            )
+
             raise ProviderExecutionError(
-                provider=provider,
+                code="circuit_open",
                 message=(
-                    f"Provider '{provider}' is "
-                    "temporarily unavailable because "
-                    "its circuit is open."
+                    f"Provider '{provider}' is temporarily "
+                    "unavailable because its circuit breaker "
+                    "is open."
                 ),
+                status_code=503,
+                provider=provider,
                 category="circuit_open",
                 retryable=True,
             )
 
-        # max_retries means retries AFTER the
-        # first attempt.
+        # --------------------------------------------------------------
+        # Retry count
+        # --------------------------------------------------------------
+
+        try:
+            configured_retries = int(
+                config.max_retries
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            configured_retries = 0
+
+        # Protect the system from accidental huge retry counts.
         max_attempts = max(
             1,
             min(
-                config.max_retries + 1,
+                configured_retries + 1,
                 4,
             ),
         )
 
-        last_error: Optional[Exception] = None
+        last_error: ProviderExecutionError | None = None
+
+        # ==============================================================
+        # EXECUTION LOOP
+        # ==============================================================
 
         for attempt in range(
             1,
             max_attempts + 1,
         ):
 
+            logger.info(
+                "provider_execution_started",
+                extra={
+                    "provider": provider,
+                    "model": model,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                },
+            )
+
             try:
 
-                logger.info(
-                    "provider_execution_started",
-                    extra={
-                        "provider": provider,
-                        "model": model,
-                        "attempt": attempt,
-                    },
-                )
+                # ------------------------------------------------------
+                # Provider timeout
+                # ------------------------------------------------------
+
+                try:
+                    timeout_seconds = float(
+                        config.timeout
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    timeout_seconds = 120.0
 
                 raw_response = await asyncio.wait_for(
                     operation(),
-                    timeout=config.timeout,
+                    timeout=timeout_seconds,
                 )
 
-                # Successful provider request.
-                self.circuit_breaker.record_success(
-                    provider
-                )
+                # ------------------------------------------------------
+                # Extract final text
+                # ------------------------------------------------------
 
                 content = self._extract_content(
                     raw_response
+                )
+
+                if not content:
+                    raise ProviderExecutionError(
+                        code="empty_provider_response",
+                        message=(
+                            f"Provider '{provider}' returned "
+                            "an empty response."
+                        ),
+                        status_code=502,
+                        provider=provider,
+                        category="empty_provider_response",
+                        retryable=True,
+                        attempts=attempt,
+                    )
+
+                # ------------------------------------------------------
+                # Success
+                # ------------------------------------------------------
+
+                self.circuit_breaker.record_success(
+                    provider
                 )
 
                 logger.info(
@@ -209,189 +312,339 @@ class ProviderExecutor:
                     attempts=attempt,
                 )
 
+            # ==========================================================
+            # TIMEOUT
+            # ==========================================================
+
             except asyncio.TimeoutError as exc:
 
-                last_error = exc
+                last_error = ProviderExecutionError(
+                    code="provider_timeout",
+                    message=(
+                        f"Provider '{provider}' timed out "
+                        f"after {config.timeout} seconds."
+                    ),
+                    status_code=504,
+                    provider=provider,
+                    category="provider_timeout",
+                    retryable=True,
+                    attempts=attempt,
+                )
 
                 self.circuit_breaker.record_failure(
                     provider
                 )
 
                 logger.warning(
-                    "provider_execution_timeout",
+                    "provider_timeout",
                     extra={
                         "provider": provider,
                         "model": model,
                         "attempt": attempt,
+                        "max_attempts": max_attempts,
                     },
                 )
 
                 if attempt >= max_attempts:
+                    raise last_error from exc
 
-                    raise ProviderExecutionError(
-                        provider=provider,
-                        message=(
-                            f"Provider '{provider}' "
-                            f"timed out after "
-                            f"{attempt} attempt(s)."
-                        ),
-                        category="timeout",
-                        retryable=True,
-                        attempts=attempt,
-                    ) from exc
+            # ==========================================================
+            # OUR NORMALIZED PROVIDER ERROR
+            # ==========================================================
 
-            except Exception as exc:
+            except ProviderExecutionError as exc:
+
+                # Make sure provider metadata is always available.
+                if exc.provider is None:
+                    exc.provider = provider
+
+                if not exc.category:
+                    exc.category = exc.code
+
+                if exc.attempts < attempt:
+                    exc.attempts = attempt
 
                 last_error = exc
 
-                retryable = (
-                    self._is_retryable_error(exc)
+                # ------------------------------------------------------
+                # Non-retryable provider errors
+                # ------------------------------------------------------
+
+                if not exc.retryable:
+
+                    logger.error(
+                        "provider_non_retryable_error",
+                        extra={
+                            "provider": provider,
+                            "model": model,
+                            "category": exc.category,
+                            "code": exc.code,
+                            "attempt": attempt,
+                        },
+                    )
+
+                    raise exc
+
+                # ------------------------------------------------------
+                # Retryable provider errors
+                # ------------------------------------------------------
+
+                self.circuit_breaker.record_failure(
+                    provider
                 )
 
-                # Only count actual provider
-                # failures against the circuit.
+                logger.warning(
+                    "provider_retryable_error",
+                    extra={
+                        "provider": provider,
+                        "model": model,
+                        "category": exc.category,
+                        "code": exc.code,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                    },
+                )
+
+                if attempt >= max_attempts:
+                    raise exc
+
+            # ==========================================================
+            # UNKNOWN / SDK ERROR
+            # ==========================================================
+
+            except Exception as exc:
+
+                retryable = self._is_retryable_error(
+                    exc
+                )
+
+                category = self._error_category(
+                    exc
+                )
+
+                safe_message = (
+                    self._safe_error_message(
+                        exc
+                    )
+                )
+
+                normalized_error = (
+                    ProviderExecutionError(
+                        code=category,
+                        message=safe_message,
+                        status_code=(
+                            self._status_code_for_category(
+                                category
+                            )
+                        ),
+                        provider=provider,
+                        category=category,
+                        retryable=retryable,
+                        attempts=attempt,
+                    )
+                )
+
+                last_error = normalized_error
+
                 if retryable:
                     self.circuit_breaker.record_failure(
                         provider
                     )
 
                 logger.warning(
-                    "provider_execution_error",
+                    "provider_unknown_error",
                     extra={
                         "provider": provider,
                         "model": model,
-                        "attempt": attempt,
+                        "category": category,
                         "retryable": retryable,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
                     },
                 )
 
-                if (
-                    not retryable
-                    or attempt >= max_attempts
-                ):
+                if not retryable:
+                    raise normalized_error from exc
 
-                    raise ProviderExecutionError(
-                        provider=provider,
-                        message=(
-                            self._safe_error_message(
-                                exc
-                            )
-                        ),
-                        category=(
-                            self._error_category(exc)
-                        ),
-                        retryable=retryable,
-                        attempts=attempt,
-                    ) from exc
+                if attempt >= max_attempts:
+                    raise normalized_error from exc
 
-            # Exponential backoff.
-            #
-            # Attempt 1 -> 1 second
-            # Attempt 2 -> 2 seconds
-            # Attempt 3 -> 4 seconds
+            # ==========================================================
+            # BACKOFF
+            # ==========================================================
+
             delay = min(
                 2 ** (attempt - 1),
                 8,
             )
 
+            logger.info(
+                "provider_retry_backoff",
+                extra={
+                    "provider": provider,
+                    "model": model,
+                    "delay_seconds": delay,
+                    "next_attempt": attempt + 1,
+                },
+            )
+
             await asyncio.sleep(delay)
 
+        # ==================================================================
+        # DEFENSIVE FINAL ERROR
+        # ==================================================================
+
+        if last_error is not None:
+            raise last_error
+
         raise ProviderExecutionError(
+            code="provider_execution_failed",
+            message=(
+                f"Provider '{provider}' execution failed."
+            ),
+            status_code=502,
             provider=provider,
-            message="Provider execution failed.",
-            category="provider_error",
-            retryable=True,
+            category="provider_execution_failed",
+            retryable=False,
             attempts=max_attempts,
-        ) from last_error
+        )
+
+    # ==================================================================
+    # RESPONSE EXTRACTION
+    # ==================================================================
 
     @staticmethod
     def _extract_content(
         response: Any,
     ) -> str:
+        """
+        Convert common provider response structures into
+        a normalized string.
+
+        Provider adapters normally already return strings,
+        but this keeps the executor resilient to generic
+        provider implementations.
+        """
 
         if response is None:
             return ""
 
+        # --------------------------------------------------------------
+        # Plain string
+        # --------------------------------------------------------------
+
         if isinstance(response, str):
-            return response
+            return response.strip()
+
+        # --------------------------------------------------------------
+        # Dictionary responses
+        # --------------------------------------------------------------
 
         if isinstance(response, dict):
 
-            # Common APIL/provider response fields.
             for key in (
                 "content",
                 "response",
                 "text",
                 "output",
-                "message",
             ):
-
                 value = response.get(key)
 
                 if isinstance(value, str):
-                    return value
+                    return value.strip()
 
-                if isinstance(value, dict):
+            # message = {"content": "..."}
+            message = response.get(
+                "message"
+            )
 
-                    nested_content = value.get(
-                        "content"
+            if isinstance(message, str):
+                return message.strip()
+
+            if isinstance(message, dict):
+
+                content = message.get(
+                    "content"
+                )
+
+                if isinstance(content, str):
+                    return content.strip()
+
+            # OpenAI-style:
+            #
+            # {
+            #   "choices": [
+            #       {
+            #           "message": {
+            #               "content": "..."
+            #           }
+            #       }
+            #   ]
+            # }
+            choices = response.get(
+                "choices"
+            )
+
+            if isinstance(
+                choices,
+                list,
+            ) and choices:
+
+                first_choice = choices[0]
+
+                if isinstance(
+                    first_choice,
+                    dict,
+                ):
+
+                    choice_message = (
+                        first_choice.get(
+                            "message"
+                        )
                     )
 
                     if isinstance(
-                        nested_content,
-                        str,
-                    ):
-                        return nested_content
-
-            # OpenAI-style:
-            choices = response.get("choices")
-
-            if isinstance(choices, list):
-                if choices:
-
-                    first = choices[0]
-
-                    if isinstance(
-                        first,
+                        choice_message,
                         dict,
                     ):
 
-                        message = first.get(
-                            "message"
+                        content = (
+                            choice_message.get(
+                                "content"
+                            )
                         )
 
                         if isinstance(
-                            message,
-                            dict,
-                        ):
-
-                            content = message.get(
-                                "content"
-                            )
-
-                            if isinstance(
-                                content,
-                                str,
-                            ):
-                                return content
-
-                        text = first.get("text")
-
-                        if isinstance(
-                            text,
+                            content,
                             str,
                         ):
-                            return text
+                            return content.strip()
 
-        # Object-style response.
+                    text = first_choice.get(
+                        "text"
+                    )
+
+                    if isinstance(
+                        text,
+                        str,
+                    ):
+                        return text.strip()
+
+        # --------------------------------------------------------------
+        # Object-based SDK responses
+        # --------------------------------------------------------------
+
         content = getattr(
             response,
             "content",
             None,
         )
 
-        if isinstance(content, str):
-            return content
+        if isinstance(
+            content,
+            str,
+        ):
+            return content.strip()
 
         text = getattr(
             response,
@@ -399,81 +652,125 @@ class ProviderExecutor:
             None,
         )
 
-        if isinstance(text, str):
-            return text
+        if isinstance(
+            text,
+            str,
+        ):
+            return text.strip()
 
-        return str(response)
+        message = getattr(
+            response,
+            "message",
+            None,
+        )
+
+        if message is not None:
+
+            message_content = getattr(
+                message,
+                "content",
+                None,
+            )
+
+            if isinstance(
+                message_content,
+                str,
+            ):
+                return message_content.strip()
+
+        return ""
+
+    # ==================================================================
+    # RETRY CLASSIFICATION
+    # ==================================================================
 
     @staticmethod
     def _is_retryable_error(
-        error: Exception,
+        exc: Exception,
     ) -> bool:
 
         error_name = (
-            error.__class__.__name__.lower()
+            type(exc).__name__.lower()
         )
 
-        retryable_names = {
-            "timeouterror",
-            "timeoutexception",
-            "connectionerror",
-            "connectionexception",
-            "connecterror",
-            "connectexception",
-            "readerror",
-            "readtimeout",
-            "temporaryerror",
-        }
+        message = str(exc).lower()
 
-        if error_name in retryable_names:
+        retryable_class_names = (
+            "timeout",
+            "connection",
+            "connect",
+            "temporarily",
+            "rate",
+            "server",
+            "serviceunavailable",
+        )
+
+        if any(
+            keyword in error_name
+            for keyword in retryable_class_names
+        ):
             return True
 
-        message = str(error).lower()
-
-        retryable_keywords = (
+        retryable_messages = (
             "timeout",
             "timed out",
-            "connection refused",
             "connection reset",
-            "connection aborted",
+            "connection refused",
+            "connection error",
             "temporarily unavailable",
-            "service unavailable",
-            "too many requests",
+            "temporary failure",
             "rate limit",
+            "too many requests",
             "429",
             "500",
             "502",
             "503",
             "504",
+            "internal server error",
+            "bad gateway",
+            "service unavailable",
         )
 
         return any(
             keyword in message
-            for keyword in retryable_keywords
+            for keyword in retryable_messages
         )
+
+    # ==================================================================
+    # ERROR CATEGORY
+    # ==================================================================
 
     @staticmethod
     def _error_category(
-        error: Exception,
+        exc: Exception,
     ) -> str:
 
-        message = str(error).lower()
+        error_name = (
+            type(exc).__name__.lower()
+        )
 
-        if "timeout" in message:
-            return "timeout"
+        message = str(exc).lower()
 
         if (
-            "connection" in message
-            or "connect" in message
+            "timeout" in error_name
+            or "timed out" in message
         ):
-            return "connection_error"
+            return "provider_timeout"
+
+        if (
+            "connection" in error_name
+            or "connection error" in message
+            or "connection refused" in message
+            or "connection reset" in message
+        ):
+            return "provider_connection_error"
 
         if (
             "429" in message
             or "rate limit" in message
             or "too many requests" in message
         ):
-            return "rate_limited"
+            return "provider_rate_limited"
 
         if any(
             code in message
@@ -484,50 +781,88 @@ class ProviderExecutor:
                 "504",
             )
         ):
-            return "provider_unavailable"
+            return "provider_server_error"
 
         if (
             "401" in message
+            or "403" in message
             or "unauthorized" in message
-            or "invalid api key" in message
+            or "forbidden" in message
+            or "authentication" in message
         ):
-            return "authentication_error"
+            return "provider_authentication_error"
 
         if (
             "400" in message
-            or "invalid request" in message
             or "bad request" in message
+            or "invalid request" in message
         ):
-            return "invalid_request"
+            return "provider_bad_request"
 
         return "provider_error"
 
+    # ==================================================================
+    # STATUS CODE MAPPING
+    # ==================================================================
+
+    @staticmethod
+    def _status_code_for_category(
+        category: str,
+    ) -> int:
+
+        mapping = {
+            "provider_timeout": 504,
+            "provider_connection_error": 502,
+            "provider_rate_limited": 429,
+            "provider_server_error": 502,
+            "provider_authentication_error": 502,
+            "provider_bad_request": 400,
+            "provider_error": 502,
+        }
+
+        return mapping.get(
+            category,
+            502,
+        )
+
+    # ==================================================================
+    # SAFE ERROR MESSAGE
+    # ==================================================================
+
     @staticmethod
     def _safe_error_message(
-        error: Exception,
+        exc: Exception,
     ) -> str:
 
-        message = str(error).strip()
+        message = str(exc).strip()
 
         if not message:
             return "Provider execution failed."
 
-        sensitive_words = (
+        sensitive_keywords = (
             "api_key",
             "apikey",
             "authorization",
-            "bearer ",
             "password",
             "secret",
-            "token",
+            "access_token",
+            "refresh_token",
+            "bearer ",
+            "token=",
         )
 
-        lower_message = message.lower()
+        lowered = message.lower()
 
         if any(
-            word in lower_message
-            for word in sensitive_words
+            keyword in lowered
+            for keyword in sensitive_keywords
         ):
-            return "Provider request failed."
+            return (
+                "Provider execution failed due to "
+                "a protected credential or "
+                "authentication error."
+            )
 
-        return message
+        # Prevent huge SDK exceptions from entering
+        # API responses/logging.
+        return message[:1000]

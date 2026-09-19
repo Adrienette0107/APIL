@@ -1,10 +1,13 @@
 from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 BASE_DIR = Path(__file__).resolve().parents[3]
+
+load_dotenv(BASE_DIR / ".env", override=False)
 
 
 class Settings(BaseSettings):
@@ -24,20 +27,24 @@ class Settings(BaseSettings):
 
     OLLAMA_URL: str = "http://127.0.0.1:11434"
     OLLAMA_MODEL: str = "qwen3:4b"
+
     OLLAMA_TIMEOUT_SECONDS: float = Field(
-    default=600.0,
-    validation_alias=AliasChoices(
-        "OLLAMA_TIMEOUT_SECONDS",
-        "OLLAMA_TIMEOUT",
-    ),
-)
-    OLLAMA_THINK: bool = False
+        default=120.0,
+        validation_alias=AliasChoices(
+            "OLLAMA_TIMEOUT_SECONDS",
+            "OLLAMA_TIMEOUT",
+        ),
+    )
+
     OLLAMA_KEEP_ALIVE: str = "10m"
     OLLAMA_NUM_PREDICT: int = 4096
 
     APIL_API_KEY: str | None = None
+
     APIL_MAX_IMPROVEMENT_ATTEMPTS: int = 1
-    APIL_IMPROVEMENT_TIMEOUT_SECONDS: float = 20.0
+
+    APIL_IMPROVEMENT_TIMEOUT_SECONDS: float = 10.0
+
     APIL_ENABLE_DEBUG_METADATA: bool = True
 
     RATE_LIMIT_REQUESTS: int = 30

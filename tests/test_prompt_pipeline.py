@@ -11,6 +11,7 @@ from backend.app.services.prompt_optimizer import PromptOptimizer
 from backend.app.services.response_evaluator import evaluate_response
 from backend.app.services.response_improver import improve_response
 from backend.app.services.response_sanitizer import sanitize_model_output
+from backend.app.services.output_verifier import OutputVerifier
 from backend.app.services.apil_pipeline import get_generation_budget
 from backend.app.services import response_improver as response_improver_module
 
@@ -239,6 +240,32 @@ def test_requirement_driven_evaluator_flags_reasoning_leakage():
     assert any("reasoning" in issue.lower() for issue in evaluation["issues"])
 
 
+def test_output_verifier_uses_consistent_boolean_semantics():
+    verifier = OutputVerifier()
+    leaking = verifier.verify(
+        "Explain photosynthesis.",
+        "Let me think about the answer. <think>private</think>",
+    )
+    clean = verifier.verify(
+        "Explain photosynthesis.",
+        "Photosynthesis is how plants use light to make food.",
+    )
+    assert leaking["checks"]["thinking_leakage"] is False
+    assert clean["checks"]["thinking_leakage"] is True
+    assert clean["checks"]["non_empty"] is True
+
+
+def test_evaluator_flags_too_short_response():
+    evaluation = evaluate_response(
+        original_prompt="Explain photosynthesis.",
+        optimized_prompt="Explain photosynthesis.",
+        response="42",
+        prompt_dna={},
+    )
+    assert evaluation["improvement_needed"] is True
+    assert any("short" in issue.lower() for issue in evaluation["issues"])
+
+
 def test_no_unnecessary_improvement_when_response_already_satisfies_request():
     prompt = "Return a single sentence answering: what is the capital of France?"
     dna = extract_prompt_dna(prompt, {"language": "English"}).to_dict()
@@ -279,8 +306,12 @@ def test_improver_attempts_correction_for_json_format_violation():
 
 
 def test_improvement_success_sets_applied_true(monkeypatch):
+    calls = 0
+
     class SuccessfulProvider:
         async def generate(self, **kwargs):
+            nonlocal calls
+            calls += 1
             return "Improved final answer."
 
     monkeypatch.setattr(
@@ -301,6 +332,8 @@ def test_improvement_success_sets_applied_true(monkeypatch):
     assert result["improvement_attempted"] is True
     assert result["improvement_applied"] is True
     assert result["response"] == "Improved final answer."
+    assert result["provider_call_count"] == 1
+    assert calls == 1
 
 
 def test_improvement_timeout_preserves_best_response(monkeypatch):

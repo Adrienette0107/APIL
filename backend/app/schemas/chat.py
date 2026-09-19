@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -25,11 +25,13 @@ class ChatRequest(BaseModel):
         ...,
         min_length=1,
         max_length=10000,
+        description="User prompt to process.",
     )
 
     model: str = Field(
         default="auto",
         max_length=100,
+        description="Model selection. Use 'auto' or provider:model.",
     )
 
     user_id: str = Field(
@@ -52,17 +54,39 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     request_id: str
     status: str
+
     original_prompt: str
     optimized_prompt: str
-    prompt_dna: dict
-    selected_model: str
-    selected_provider: str | None = None
-    response: str
-    response_evaluation: dict | None = None
-    improvement_applied: bool = False
-    message: str | None = None
+    prompt_dna: dict[str, Any]
+
     processed_prompt: str | None = None
-    provider_call_count: int = 1
-    timing: dict | None = None
+
+    selected_provider: str | None = None
+    selected_model: str
+
+    response: str
+
+    raw_provider_response: str | None = None
+    raw_response: str | None = None
+    final_response: str | None = None
+
+    response_evaluation: dict[str, Any] | None = None
+    final_quality_gate: dict[str, Any] | None = None
+    verification: dict[str, Any] | None = None
+
+    improvement_applied: bool = False
     improvement_attempted: bool = False
+    improvement_attempts: int = 0
+    improvement_needed: bool = False
+    improvement_error: str | None = None
     improvement_failure_reason: str | None = None
+
+    provider_call_count: int = 1
+    provider_attempts: int = 1
+
+    timing: dict[str, Any] | None = None
+
+    preferences: dict[str, Any] | None = None
+    analysis: dict[str, Any] | None = None
+
+    message: str | None = None
